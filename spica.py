@@ -1,162 +1,170 @@
-import openai
 import os
-import datetime
+import asyncio
+import json
+import logging
+import base64
+from getpass import getpass
+from typing import Optional, Dict, List
 from dotenv import load_dotenv
-from solana.rpc.api import Client
+from solana.rpc.async_api import AsyncClient
+from solana.rpc.commitment import Confirmed
+from solana.rpc.types import TxOpts
+from solana.publickey import PublicKey
 from solana.keypair import Keypair
 from solana.transaction import Transaction
 from solana.system_program import TransferParams, transfer
-import re
+from solana.rpc.core import RPCException
+from spl.token.constants import TOKEN_PROGRAM_ID
+from spl.token.instructions import transfer_checked, TransferCheckedParams
+from cryptography.fernet import Fernet
+import openai
+from rich.console import Console
+from rich.table import Table
+from rich.prompt import Prompt
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # Load environment variables
-def load_env_vars():
-    load_dotenv()
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    solana_rpc_url = os.getenv("SOLANA_RPC_URL")
-    solana_private_key = os.getenv("SOLANA_PRIVATE_KEY")
-    solana_public_key = os.getenv("SOLANA_PUBLIC_KEY")
+load_dotenv()
 
-    if not all([openai_api_key, solana_rpc_url, solana_private_key, solana_public_key]):
-        raise ValueError("Missing one or more required environment variables.")
+# Initialize rich console
+console = Console()
 
-    return openai_api_key, solana_rpc_url, solana_private_key, solana_public_key
+# Constants
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY") or Fernet.generate_key().decode()
+CACHE_FILE = "response_cache.json"
 
-# Log conversation
-def log_conversation(user_input, model_response):
-    log_filename = "conversation_log.txt"
-    with open(log_filename, 'a') as log_file:
-        log_file.write(f"Timestamp: {datetime.datetime.now()}\n")
-        log_file.write(f"You: {user_input}\n")
-        log_file.write(f"Chatbot: {model_response}\n")
-        log_file.write("-" * 50 + "\n")
+# Initialize encryption
+fernet = Fernet(ENCRYPTION_KEY.encode())
 
-# Get conversation history
-def get_conversation_history():
-    try:
-        with open("conversation_log.txt", 'r') as file:
-            return file.read()
-    except FileNotFoundError:
-        return ""
+# Load or initialize cache
+if os.path.exists(CACHE_FILE):
+    with open(CACHE_FILE, "r") as f:
+        response_cache = json.load(f)
+else:
+    response_cache = {}
 
-# Construct prompt dynamically
-def construct_dynamic_prompt(user_input, conversation_history, max_tokens=1000):
-    trimmed_history = ""
-    for line in reversed(conversation_history.splitlines()):
-        if len(trimmed_history.split()) + len(line.split()) <= max_tokens:
-            trimmed_history = line + "\n" + trimmed_history
-        else:
-            break
+# Wallet management
+wallets: Dict[str, Keypair] = {}
 
-    return f"""
-You are a helpful assistant in a friendly, conversational setting.
-You have the following conversation history:
-{trimmed_history}
+# Solana client
+solana_client = AsyncClient(SOLANA_RPC_URL)
 
-User: {user_input}
-Assistant:
-"""
+# OpenAI setup
+openai.api_key = OPENAI_API_KEY
 
-# Validate Solana address
-def validate_solana_address(address):
+# Helper Functions
+def encrypt_data(data: str) -> str:
+    return fernet.encrypt(data.encode()).decode()
+
+def decrypt_data(encrypted_data: str) -> str:
+    return fernet.decrypt(encrypted_data.encode()).decode()
+
+def save_cache():
+    with open(CACHE_FILE, "w") as f:
+        json.dump(response_cache, f)
+
+def validate_solana_address(address: str) -> bool:
     return len(address) == 44
 
-# Validate transaction amount
-def validate_transaction_amount(amount):
+def validate_transaction_amount(amount: str) -> bool:
     try:
-        amount = float(amount)
-        return amount > 0
+        return float(amount) > 0
     except ValueError:
         return False
 
-# Handle special commands
-def handle_special_commands(user_input):
-    if "hello" in user_input.lower() or "hi" in user_input.lower():
-        return "Hello! How can I assist you today?"
-    elif "help" in user_input.lower():
-        return display_help_menu()
-    elif "exit" in user_input.lower() or "quit" in user_input.lower():
-        graceful_shutdown()
-    elif "solana balance" in user_input.lower():
-        return get_solana_balance_safe()
-    elif "send solana" in user_input.lower():
-        amount, recipient = parse_solana_transaction_command(user_input)
-        if amount and recipient:
-            return send_solana_transaction_safe(amount, recipient)
-        return "Invalid command format. Use: send solana <amount> to <recipient>"
-    else:
+# Wallet Management
+def connect_wallet(wallet_name: str, private_key: Optional[str] = None):
+    if not private_key:
+        private_key = getpass("Enter your private key (base58 encoded): ")
+    try:
+        keypair = Keypair.from_secret_key(base58.b58decode(private_key))
+        wallets[wallet_name] = keypair
+        console.print(f"[green]Wallet '{wallet_name}' connected: {keypair.public_key}[/green]")
+    except Exception as e:
+        console.print(f"[red]Failed to connect wallet: {e}[/red]")
+
+# Solana Functions
+async def get_solana_balance(wallet_name: str) -> Optional[float]:
+    if wallet_name not in wallets:
+        console.print(f"[red]Wallet '{wallet_name}' not found.[/red]")
+        return None
+    try:
+        balance = await solana_client.get_balance(wallets[wallet_name].public_key, commitment=Confirmed)
+        lamports = balance["result"]["value"]
+        return lamports / 10**9
+    except RPCException as e:
+        console.print(f"[red]Error fetching balance: {e}[/red]")
         return None
 
-# Display help menu
-def display_help_menu():
-    commands = {
-        "hello": "Greets the chatbot.",
-        "help": "Displays this help menu.",
-        "exit": "Ends the chat session.",
-        "solana balance": "Checks your Solana wallet balance.",
-        "send solana <amount> to <recipient>": "Sends SOL to the specified recipient.",
-    }
-    help_message = "Here are the available commands:\n"
-    for command, description in commands.items():
-        help_message += f"- {command}: {description}\n"
-    return help_message
+async def send_solana_transaction(wallet_name: str, recipient: str, amount: float, token_address: Optional[str] = None):
+    if wallet_name not in wallets:
+        console.print(f"[red]Wallet '{wallet_name}' not found.[/red]")
+        return
 
-# Graceful shutdown
-def graceful_shutdown():
-    print("Chatbot: Saving conversation and shutting down. Goodbye!")
-    exit(0)
+    if not validate_solana_address(recipient):
+        console.print("[red]Invalid recipient address.[/red]")
+        return
 
-# Parse Solana transaction command
-def parse_solana_transaction_command(user_input):
-    match = re.search(r"send solana (\d+(\.\d+)?) to (\S+)", user_input.lower())
-    if match:
-        amount = float(match.group(1))
-        recipient_address = match.group(3)
-        return amount, recipient_address
-    return None, None
+    if not validate_transaction_amount(str(amount)):
+        console.print("[red]Invalid transaction amount.[/red]")
+        return
 
-# Get Solana balance safely
-def get_solana_balance_safe():
     try:
-        _, solana_rpc_url, _, solana_public_key = load_env_vars()
-        solana_client = Client(solana_rpc_url)
-        balance = solana_client.get_balance(solana_public_key)
-        lamports = balance['result']['value']
-        sol_balance = lamports / 10**9
-        return f"Your Solana balance is: {sol_balance:.9f} SOL"
-    except Exception as e:
-        return f"Error fetching Solana balance: {str(e)}"
+        sender_keypair = wallets[wallet_name]
+        recipient_pubkey = PublicKey(recipient)
 
-# Send Solana transaction safely
-def send_solana_transaction_safe(amount, recipient_public_key):
-    try:
-        openai_api_key, solana_rpc_url, solana_private_key, _ = load_env_vars()
-
-        if not validate_solana_address(recipient_public_key):
-            return "Invalid recipient address."
-        if not validate_transaction_amount(amount):
-            return "Invalid transaction amount."
-
-        solana_client = Client(solana_rpc_url)
-        sender_keypair = Keypair.from_secret_key(bytes.fromhex(solana_private_key))
-
-        transaction = Transaction().add(
-            transfer(
-                TransferParams(
-                    from_pubkey=sender_keypair.public_key,
-                    to_pubkey=recipient_public_key,
-                    lamports=int(amount * 10**9)
+        if token_address:
+            # SPL Token Transfer
+            token_pubkey = PublicKey(token_address)
+            transaction = Transaction().add(
+                transfer_checked(
+                    TransferCheckedParams(
+                        program_id=TOKEN_PROGRAM_ID,
+                        source=sender_keypair.public_key,
+                        mint=token_pubkey,
+                        dest=recipient_pubkey,
+                        owner=sender_keypair.public_key,
+                        amount=int(amount * 10**9),  # Adjust for token decimals
+                        decimals=9
+                    )
                 )
             )
-        )
-        response = solana_client.send_transaction(transaction, sender_keypair)
-        return f"Transaction successful. Transaction ID: {response['result']}"
-    except Exception as e:
-        return f"Error sending transaction: {str(e)}"
+        else:
+            # SOL Transfer
+            transaction = Transaction().add(
+                transfer(
+                    TransferParams(
+                        from_pubkey=sender_keypair.public_key,
+                        to_pubkey=recipient_pubkey,
+                        lamports=int(amount * 10**9)
+                    )
+                )
+            )
 
-# Get OpenAI response
-def get_response(prompt):
+        transaction.sign(sender_keypair)
+        response = await solana_client.send_transaction(transaction, sender_keypair, opts=TxOpts(skip_confirmation=False))
+        console.print(f"[green]Transaction successful. Transaction ID: {response['result']}[/green]")
+    except RPCException as e:
+        console.print(f"[red]Transaction failed: {e}[/red]")
+
+# OpenAI Functions
+def get_cached_response(prompt: str) -> Optional[str]:
+    return response_cache.get(prompt)
+
+def cache_response(prompt: str, response: str):
+    response_cache[prompt] = response
+    save_cache()
+
+async def get_openai_response(prompt: str) -> str:
+    cached_response = get_cached_response(prompt)
+    if cached_response:
+        return cached_response
+
     try:
-        openai.api_key, _, _, _ = load_env_vars()
         response = openai.Completion.create(
             engine="text-davinci-003",
             prompt=prompt,
@@ -165,32 +173,64 @@ def get_response(prompt):
             n=1,
             stop=None,
         )
-        return response.choices[0].text.strip()
+        generated_text = response.choices[0].text.strip()
+        cache_response(prompt, generated_text)
+        return generated_text
     except Exception as e:
         return f"Error: {str(e)}"
 
-# Chat loop
-def chat():
-    print("Chatbot: Hello! I'm here to chat with you. Type 'exit' to end the conversation.")
-    conversation_history = get_conversation_history()
+# Main Chatbot
+async def chatbot():
+    console.print("[bold blue]Welcome to the Advanced Solana Chatbot![/bold blue]")
+    console.print("Type 'help' for a list of commands.")
 
     while True:
-        user_input = input("You: ")
+        user_input = Prompt.ask("You")
+        if user_input.lower() in ["exit", "quit"]:
+            console.print("[bold red]Goodbye![/bold red]")
+            break
 
-        special_response = handle_special_commands(user_input)
-        if special_response:
-            print(f"Chatbot: {special_response}")
-            if "exit" in user_input.lower() or "quit" in user_input.lower():
-                break
+        if user_input.lower() == "help":
+            console.print(
+                """
+[bold]Commands:[/bold]
+- connect_wallet <wallet_name>: Connect a Solana wallet.
+- balance <wallet_name>: Check wallet balance.
+- send <wallet_name> <amount> to <recipient> [token_address]: Send SOL or SPL tokens.
+- chat <message>: Chat with the AI.
+- exit: Exit the chatbot.
+"""
+            )
             continue
 
-        prompt = construct_dynamic_prompt(user_input, conversation_history)
-        response = get_response(prompt)
+        if user_input.startswith("connect_wallet"):
+            _, wallet_name = user_input.split(maxsplit=1)
+            connect_wallet(wallet_name)
 
-        print(f"Chatbot: {response}")
+        elif user_input.startswith("balance"):
+            _, wallet_name = user_input.split(maxsplit=1)
+            balance = await get_solana_balance(wallet_name)
+            if balance is not None:
+                console.print(f"[green]Balance: {balance:.9f} SOL[/green]")
 
-        log_conversation(user_input, response)
-        conversation_history += f"User: {user_input}\nAssistant: {response}\n"
+        elif user_input.startswith("send"):
+            parts = user_input.split()
+            if len(parts) < 5:
+                console.print("[red]Usage: send <wallet_name> <amount> to <recipient> [token_address][/red]")
+                continue
+            wallet_name, amount, _, recipient, *token_address = parts
+            token_address = token_address[0] if token_address else None
+            await send_solana_transaction(wallet_name, recipient, float(amount), token_address)
 
+        elif user_input.startswith("chat"):
+            _, *message = user_input.split()
+            prompt = " ".join(message)
+            response = await get_openai_response(prompt)
+            console.print(f"[bold cyan]Chatbot:[/bold cyan] {response}")
+
+        else:
+            console.print("[red]Invalid command. Type 'help' for assistance.[/red]")
+
+# Run the chatbot
 if __name__ == "__main__":
-    chat()
+    asyncio.run(chatbot())
