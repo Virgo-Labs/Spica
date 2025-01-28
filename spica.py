@@ -3,6 +3,9 @@ import asyncio
 import json
 import logging
 import base64
+import csv
+import aiohttp
+import pyotp
 from getpass import getpass
 from typing import Optional, Dict, List
 from dotenv import load_dotenv
@@ -49,12 +52,16 @@ else:
 
 # Wallet management
 wallets: Dict[str, Keypair] = {}
+current_wallet: Optional[str] = None
 
 # Solana client
 solana_client = AsyncClient(SOLANA_RPC_URL)
 
 # OpenAI setup
 openai.api_key = OPENAI_API_KEY
+
+# 2FA setup
+totp = pyotp.TOTP(pyotp.random_base32())
 
 # Helper Functions
 def encrypt_data(data: str) -> str:
@@ -76,6 +83,9 @@ def validate_transaction_amount(amount: str) -> bool:
     except ValueError:
         return False
 
+def verify_2fa(code: str) -> bool:
+    return totp.verify(code)
+
 # Wallet Management
 def connect_wallet(wallet_name: str, private_key: Optional[str] = None):
     if not private_key:
@@ -86,6 +96,14 @@ def connect_wallet(wallet_name: str, private_key: Optional[str] = None):
         console.print(f"[green]Wallet '{wallet_name}' connected: {keypair.public_key}[/green]")
     except Exception as e:
         console.print(f"[red]Failed to connect wallet: {e}[/red]")
+
+def switch_wallet(new_wallet: str) -> Optional[str]:
+    if new_wallet in wallets:
+        console.print(f"[green]Switched to wallet '{new_wallet}'[/green]")
+        return new_wallet
+    else:
+        console.print(f"[red]Wallet '{new_wallet}' not found.[/red]")
+        return current_wallet
 
 # Solana Functions
 async def get_solana_balance(wallet_name: str) -> Optional[float]:
@@ -151,6 +169,63 @@ async def send_solana_transaction(wallet_name: str, recipient: str, amount: floa
     except RPCException as e:
         console.print(f"[red]Transaction failed: {e}[/red]")
 
+async def get_transaction_history(wallet_name: str, limit: int = 5):
+    if wallet_name not in wallets:
+        console.print(f"[red]Wallet '{wallet_name}' not found.[/red]")
+        return
+
+    try:
+        pubkey = wallets[wallet_name].public_key
+        response = await solana_client.get_signatures_for_address(pubkey, limit=limit)
+        transactions = response["result"]
+
+        table = Table(title=f"Transaction History for {wallet_name}")
+        table.add_column("Signature", style="cyan")
+        table.add_column("Slot", style="magenta")
+        table.add_column("Block Time", style="green")
+
+        for tx in transactions:
+            table.add_row(tx["signature"], str(tx["slot"]), str(tx["blockTime"]))
+
+        console.print(table)
+    except RPCException as e:
+        console.print(f"[red]Error fetching transaction history: {e}[/red]")
+
+async def get_nfts(wallet_name: str):
+    if wallet_name not in wallets:
+        console.print(f"[red]Wallet '{wallet_name}' not found.[/red]")
+        return
+
+    try:
+        pubkey = wallets[wallet_name].public_key
+        url = f"https://api.simplehash.com/api/v0/nfts/owners?wallet_addresses={pubkey}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                nfts = await response.json()
+
+        table = Table(title=f"NFTs for {wallet_name}")
+        table.add_column("Name", style="cyan")
+        table.add_column("Mint Address", style="magenta")
+        table.add_column("Collection", style="green")
+
+        for nft in nfts:
+            table.add_row(nft["name"], nft["mint_address"], nft["collection"]["name"])
+
+        console.print(table)
+    except Exception as e:
+        console.print(f"[red]Error fetching NFTs: {e}[/red]")
+
+async def get_sol_price():
+    try:
+        url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                price_data = await response.json()
+                sol_price = price_data["solana"]["usd"]
+                console.print(f"[green]Current SOL price: ${sol_price}[/green]")
+    except Exception as e:
+        console.print(f"[red]Error fetching SOL price: {e}[/red]")
+
 # OpenAI Functions
 def get_cached_response(prompt: str) -> Optional[str]:
     return response_cache.get(prompt)
@@ -159,21 +234,23 @@ def cache_response(prompt: str, response: str):
     response_cache[prompt] = response
     save_cache()
 
-async def get_openai_response(prompt: str) -> str:
+async def get_openai_response(prompt: str, context: Optional[List[str]] = None) -> str:
     cached_response = get_cached_response(prompt)
     if cached_response:
         return cached_response
 
     try:
-        response = openai.Completion.create(
-            engine="text-davinci-003",
-            prompt=prompt,
+        messages = [{"role": "user", "content": prompt}]
+        if context:
+            messages = [{"role": "system", "content": " ".join(context)}] + messages
+
+        response = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=messages,
             max_tokens=150,
             temperature=0.7,
-            n=1,
-            stop=None,
         )
-        generated_text = response.choices[0].text.strip()
+        generated_text = response.choices[0].message["content"].strip()
         cache_response(prompt, generated_text)
         return generated_text
     except Exception as e:
@@ -184,6 +261,7 @@ async def chatbot():
     console.print("[bold blue]Welcome to the Advanced Solana Chatbot![/bold blue]")
     console.print("Type 'help' for a list of commands.")
 
+    chat_context = []
     while True:
         user_input = Prompt.ask("You")
         if user_input.lower() in ["exit", "quit"]:
@@ -195,8 +273,12 @@ async def chatbot():
                 """
 [bold]Commands:[/bold]
 - connect_wallet <wallet_name>: Connect a Solana wallet.
+- switch_wallet <wallet_name>: Switch to another connected wallet.
 - balance <wallet_name>: Check wallet balance.
 - send <wallet_name> <amount> to <recipient> [token_address]: Send SOL or SPL tokens.
+- history <wallet_name>: View transaction history.
+- nfts <wallet_name>: View NFTs in the wallet.
+- price: Get the current SOL price.
 - chat <message>: Chat with the AI.
 - exit: Exit the chatbot.
 """
@@ -206,6 +288,10 @@ async def chatbot():
         if user_input.startswith("connect_wallet"):
             _, wallet_name = user_input.split(maxsplit=1)
             connect_wallet(wallet_name)
+
+        elif user_input.startswith("switch_wallet"):
+            _, new_wallet = user_input.split(maxsplit=1)
+            current_wallet = switch_wallet(new_wallet)
 
         elif user_input.startswith("balance"):
             _, wallet_name = user_input.split(maxsplit=1)
@@ -222,10 +308,23 @@ async def chatbot():
             token_address = token_address[0] if token_address else None
             await send_solana_transaction(wallet_name, recipient, float(amount), token_address)
 
+        elif user_input.startswith("history"):
+            _, wallet_name = user_input.split(maxsplit=1)
+            await get_transaction_history(wallet_name)
+
+        elif user_input.startswith("nfts"):
+            _, wallet_name = user_input.split(maxsplit=1)
+            await get_nfts(wallet_name)
+
+        elif user_input.startswith("price"):
+            await get_sol_price()
+
         elif user_input.startswith("chat"):
             _, *message = user_input.split()
             prompt = " ".join(message)
-            response = await get_openai_response(prompt)
+            response = await get_openai_response(prompt, chat_context)
+            chat_context.append(f"You: {prompt}")
+            chat_context.append(f"Chatbot: {response}")
             console.print(f"[bold cyan]Chatbot:[/bold cyan] {response}")
 
         else:
